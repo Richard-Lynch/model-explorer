@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# build — the checks every change passes, as ONE job named `gate`, so the caller's job id `ci`
+# makes the required status check `ci / gate`.
+#
+#   actionlint      the workflows themselves (pinned, checksummed binary)
+#   app             npm ci from the lockfile, the unit tests, then the typecheck and the Vite build
+#   image           the Dockerfile builds; the container answers as the app, not merely with a 200;
+#                   the mounted catalogue is served uncacheable; the security headers are present;
+#                   nginx runs as a non-root user; and the image's own HEALTHCHECK reports healthy
+#
+# Nothing is pushed and no secret is read here.
+name: build
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  ACTIONLINT_VERSION: 1.7.12
+  ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+
+jobs:
+  gate:
+    name: gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install actionlint (pinned, checksummed)
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl -fsSL -o actionlint.tgz "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tgz" | sha256sum -c -
+          tar -xzf actionlint.tgz -C "$HOME/bin" actionlint
+          rm -f actionlint.tgz
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+      - name: actionlint
+        run: actionlint -color
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - name: Install from the lockfile (no install scripts)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Unit tests (the model-id rule and the staged block)
+        run: npm test
+      - name: Release-script tests (image state, reuse check; fake docker and gh)
+        run: ci/test-release-scripts.sh
+      - name: Typecheck and build
+        run: npm run build
+
+      - name: Build the image
+        run: docker build -t model-explorer:ci .
+
+      - name: Run it with the fixture catalogue mounted, and wait for its own healthcheck
+        run: |
+          set -euo pipefail
+          # Read-only root with a tmpfs /tmp, as the deployment runs it: the image must not need
+          # to write anywhere else.
+          docker run -d --name me -p 18080:8080 --read-only --tmpfs /tmp \
+            -v "$PWD/tests/fixtures:/srv/catalogue:ro" \
+            model-explorer:ci
+          status=""
+          for _ in $(seq 1 30); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' me)
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          echo "health: $status"
+          if [ "$status" != healthy ]; then
+            docker inspect --format '{{json .State.Health}}' me
+            docker logs me
+            exit 1
+          fi
+
+      - name: The container serves the app, the catalogue and the headers, as a non-root user
+        run: |
+          set -euo pipefail
+          base=http://127.0.0.1:18080
+          # A 200 is not proof: an nginx welcome page or an error page is a 200 too.
+          page=$(curl -fsS "$base/index.html")
+          grep -q 'Model Explorer' <<<"$page" || { echo "::error::index.html is not the app"; exit 1; }
+          grep -q 'type="module"' <<<"$page" || { echo "::error::index.html carries no module bundle"; exit 1; }
+          # The catalogue parses and carries models.
+          curl -fsS "$base/catalogue.json" | jq -e '(.enumerated | length > 0) and (.openrouter | length > 0)' >/dev/null
+          # Headers are saved to files and COUNTED (grep -c), never piped into grep -q: under
+          # pipefail an early-exiting grep can fail a correct run.
+          asset=$(grep -o 'assets/[^"]*\.js' <<<"$page" | sed -n 1p)
+          [ -n "$asset" ] || { echo "::error::index.html names no hashed asset"; exit 1; }
+          for path in index.html catalogue.json "$asset" no-such-path; do
+            f="$RUNNER_TEMP/h-${path//\//_}"
+            curl -fsS -D "$f" -o /dev/null "$base/$path"
+            # Every response carries every security header (a location with its own add_header
+            # inherits none from the server block, so each one is checked).
+            for h in content-security-policy x-content-type-options x-frame-options referrer-policy; do
+              n=$(grep -ci "^$h:" "$f" || true)
+              [ "$n" = 1 ] || { echo "::error::/$path carries $n '$h' header(s)"; cat "$f"; exit 1; }
+            done
+            # script-src is EXACTLY 'self': no inline script, in any order.
+            src=$(grep -i '^content-security-policy:' "$f" | tr ';' '\n' | grep -i 'script-src' | tr -s ' ' | sed 's/^ *//; s/[[:space:]]*$//')
+            [ "$src" = "script-src 'self'" ] || { echo "::error::/$path script-src is '$src'"; exit 1; }
+            grep -qi "frame-ancestors 'none'" "$f" || { echo "::error::/$path CSP lacks frame-ancestors"; exit 1; }
+          done
+          # The catalogue is uncacheable; index.html is revalidated; hashed assets are immutable.
+          n=$(grep -ci '^cache-control: no-store' "$RUNNER_TEMP/h-catalogue.json" || true)
+          [ "$n" = 1 ] || { echo "::error::catalogue.json Cache-Control is not exactly one no-store"; exit 1; }
+          n=$(grep -ci '^cache-control: no-cache' "$RUNNER_TEMP/h-index.html" || true)
+          [ "$n" = 1 ] || { echo "::error::index.html is not served no-cache"; exit 1; }
+          n=$(grep -ci '^cache-control: .*immutable' "$RUNNER_TEMP/h-${asset//\//_}" || true)
+          [ "$n" = 1 ] || { echo "::error::$asset is not served immutable"; exit 1; }
+          # nginx's workers and master run as the image's unprivileged user.
+          uid=$(docker exec me id -u)
+          [ "$uid" != 0 ] || { echo "::error::the container runs as root"; exit 1; }
+          echo "ok: app, catalogue, headers, uid=$uid"
+
+      - name: Container logs
+        if: always()
+        run: docker logs me 2>&1 | tail -50 || true

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# disclose — thin caller of ansible-devkit's shared disclosure gate. The job id `disclose` makes
+# the required status check `disclose / gate`. It passes no secrets: the gate's generic rules need
+# no private input, and the repository's own fixture exemptions come from `.disclose-allow` at the
+# pull request's base.
+name: disclose
+
+on:
+  pull_request:
+    # `edited` re-runs the gate when a PR is retargeted to another base branch.
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  disclose:
+    uses: Richard-Lynch/ansible-devkit/.github/workflows/reusable-disclose.yml@v0.4.1

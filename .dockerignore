@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Only what the build stage copies is needed; everything else stays out of the build context.
+.git
+.github
+node_modules
+dist
+*.md
+tests
+ci

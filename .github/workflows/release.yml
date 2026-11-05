@@ -1,0 +1,277 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# release — on every push to main: if the version in package.json has no GitHub release yet,
+# build and push the image to ghcr.io/<owner>/<repo>:<version>, then create the tag and the
+# release, with the image DIGEST in the release notes and as a release asset. Releasing is "merge
+# a PR that bumps the version"; nothing is tagged by hand.
+#
+# Deploy by digest, not by tag: the digest the release records is the exact image this commit
+# built, and a tag can be moved.
+#
+# Two jobs, split as in ansible-devkit's shared release workflow:
+#   image    runs the repository's build (the Dockerfile) with the workflow token's packages:write
+#            and NO other secret, and attests its build provenance. If the version's image already
+#            exists (a re-run after a failed publish), it is NOT rebuilt: it is reused only when its
+#            revision label is this commit and its provenance verifies as this workflow's, so one
+#            version never names two images and a tag pushed by anything else is never released.
+#   publish  holds contents:write on the repository's own GITHUB_TOKEN (no App, no environment
+#            secret), checks nothing out and runs no repository code: it reserves the tag
+#            atomically and creates the release from the artifacts `image` produced.
+#
+# Both jobs declare the `publish` environment, which deploys from main only and holds no secret,
+# so a run from any other ref cannot start either write-capable job; publish also refuses a commit
+# that is not on main before tagging.
+#
+# A run that dies after pushing the image but before attesting it leaves a version that can never
+# be released without a version bump (a reuse requires provenance). That fails closed on purpose.
+#
+# ONE run does everything. A tag pushed with GITHUB_TOKEN starts no other workflow, so nothing
+# here waits for, or depends on, a tag-triggered run.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+# ONE release at a time for the whole workflow, not only the tag step: two pushes to main with the
+# same version must not both find "not built" and push two images under one tag.
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    # Deployable from main ONLY (repository setting; no secrets in it): a run from any other ref
+    # cannot start the job that holds packages:write.
+    environment: publish
+    permissions:
+      contents: read
+      packages: write
+      # actions/attest-build-provenance: sign (OIDC) and store the provenance attestation.
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      released: ${{ steps.v.outputs.released }}
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the declared version and whether it is already released
+        id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          v=$(jq -r .version package.json)
+          if ! [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version '$v' is not MAJOR.MINOR.PATCH"; exit 1
+          fi
+          # "Released" means the GitHub RELEASE exists (the last thing publish creates), so a run
+          # that died after pushing the image or reserving the tag is completed by the next run.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases/tags/v$v")
+          case "$code" in
+            200) released=true ;;
+            404) released=false ;;
+            *) echo "::error::cannot tell whether release v$v exists (HTTP $code)"; exit 1 ;;
+          esac
+          image="ghcr.io/${REPO,,}"
+          echo "version=$v released=$released image=$image"
+          {
+            echo "version=$v"
+            echo "released=$released"
+            echo "image=$image"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Release notes from the CHANGELOG section for this version
+        if: steps.v.outputs.released == 'false'
+        env:
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          awk -v v="$V" '
+            $0 ~ "^## \\[" { if (on) exit; if (index($0, "## [" v "]") == 1) { on = 1; next } }
+            on { print }
+          ' CHANGELOG.md > dist/release-notes.md
+          grep -q '[^[:space:]]' dist/release-notes.md \
+            || { echo "::error::CHANGELOG.md has no non-empty '## [$V]' section"; exit 1; }
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        if: steps.v.outputs.released == 'false'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: steps.v.outputs.released == 'false'
+
+      - name: Does this version's image already exist?
+        # ONLY a registry answer of "manifest unknown" / "not found" means "not built yet". Any
+        # other inspect failure (auth, network, a malformed answer) fails closed rather than
+        # rebuilding over, or around, an image whose state is unknown.
+        id: existing
+        if: steps.v.outputs.released == 'false'
+        env:
+          IMAGE: ${{ steps.v.outputs.image }}
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          d=$(ci/image-state.sh "$IMAGE:$V")
+          echo "$IMAGE:$V: ${d:-not built yet}"
+          echo "digest=$d" >> "$GITHUB_OUTPUT"
+
+      - name: An existing image is reused ONLY if this commit built it, with provenance from this repo
+        # A re-run after a failed publish reuses the image instead of rebuilding it, so one version
+        # never names two images. But a tag can be pushed by anything holding packages:write, so
+        # the reuse is accepted only when (a) the image's revision label is THIS commit and (b) its
+        # build provenance verifies as made by this repository's workflow. Otherwise: bump the
+        # version.
+        if: steps.v.outputs.released == 'false' && steps.existing.outputs.digest != ''
+        env:
+          IMAGE: ${{ steps.v.outputs.image }}
+          D: ${{ steps.existing.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: ci/reuse-check.sh "$IMAGE" "$D" "$GITHUB_SHA" "$REPO"
+
+      - name: Build and push
+        id: build
+        if: steps.v.outputs.released == 'false' && steps.existing.outputs.digest == ''
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
+            org.opencontainers.image.title=model-explorer
+
+      - name: Attest build provenance (pushed to the registry beside the image)
+        if: steps.v.outputs.released == 'false' && steps.existing.outputs.digest == ''
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.v.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Record the digest (read back from the registry, not trusted from the build)
+        id: digest
+        if: steps.v.outputs.released == 'false'
+        env:
+          IMAGE: ${{ steps.v.outputs.image }}
+          V: ${{ steps.v.outputs.version }}
+          BUILT: ${{ steps.build.outputs.digest }}
+          EXISTING: ${{ steps.existing.outputs.digest }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          want="${BUILT:-$EXISTING}"
+          got=$(docker buildx imagetools inspect "$IMAGE:$V" --format '{{json .Manifest}}' | jq -r .digest)
+          [[ "$got" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no digest for $IMAGE:$V"; exit 1; }
+          [ "$got" = "$want" ] || { echo "::error::registry has $got for $IMAGE:$V, expected $want"; exit 1; }
+          # The provenance a consumer would check is checkable, for a fresh build as for a reuse.
+          ci/verify-provenance.sh "$IMAGE" "$got" "$GITHUB_SHA" "$REPO"
+          echo "$IMAGE@$got" > dist/image-digest.txt
+          printf '\n## Image\n\n    %s@%s\n\nVerify its build provenance (repository, workflow, branch and commit):\n\n    gh attestation verify oci://%s@%s --repo %s --signer-workflow %s/.github/workflows/release.yml --source-ref refs/heads/main --source-digest %s\n' \
+            "$IMAGE" "$got" "$IMAGE" "$got" "$REPO" "$REPO" "$GITHUB_SHA" >> dist/release-notes.md
+          echo "digest=$got" >> "$GITHUB_OUTPUT"
+          echo "### $IMAGE:$V = $got" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.v.outputs.released == 'false'
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Already released
+        if: steps.v.outputs.released == 'true'
+        env:
+          V: ${{ steps.v.outputs.version }}
+        run: echo "v$V already exists; nothing to release."
+
+  publish:
+    needs: image
+    if: needs.image.outputs.released == 'false'
+    runs-on: ubuntu-latest
+    # Deployable from main ONLY, like the image job.
+    environment: publish
+    # The repository's OWN token, scoped to this job: contents:write for the tag and the release,
+    # nothing else. No App and no environment secret: this repository's build runs third-party npm
+    # code, so no key that reaches any other repository is ever present in its workflows.
+    permissions:
+      contents: write
+    steps:
+      # No checkout: nothing from the repository runs in the job that can write tags.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-dist
+          path: dist/
+
+      - name: The digest file names the digest the image job read back
+        env:
+          WANT: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          got=$(cut -d@ -f2 dist/image-digest.txt)
+          [ "$got" = "$WANT" ] || { echo "::error::image-digest.txt says $got, the image job read $WANT"; exit 1; }
+
+      - name: The commit to tag is main's (the environment allows main; this checks the commit)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          [ "$GITHUB_REF" = refs/heads/main ] || { echo "::error::release from $GITHUB_REF, not refs/heads/main"; exit 1; }
+          # identical: it IS main's head; behind: main has moved on past it. Anything else (ahead,
+          # diverged, an API error) means the commit is not on main, and nothing is tagged.
+          status=$(gh api "repos/$REPO/compare/main...$GITHUB_SHA" --jq .status)
+          case "$status" in
+            identical|behind) echo "$GITHUB_SHA is on main ($status)" ;;
+            *) echo "::error::$GITHUB_SHA is not on main (compare: $status)"; exit 1 ;;
+          esac
+
+      - name: Reserve the tag atomically
+        # Creating the ref FAILS if it already exists. An existing tag is accepted only when it
+        # already points at this commit (a re-run completing an earlier attempt).
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.image.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if gh api -X POST "repos/$REPO/git/refs" -f ref="refs/tags/v$V" -f sha="$GITHUB_SHA" >/dev/null 2>&1; then
+            echo "reserved v$V at $GITHUB_SHA"
+          else
+            at=$(gh api "repos/$REPO/commits/v$V" --jq .sha 2>/dev/null || true)
+            [ "$at" = "$GITHUB_SHA" ] || { echo "::error::v$V exists at '${at:-unknown}', not $GITHUB_SHA"; exit 1; }
+            echo "v$V already at $GITHUB_SHA; completing the release"
+          fi
+
+      - name: Create the GitHub release on the reserved tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.image.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "v$V" dist/image-digest.txt --repo "$REPO" --verify-tag \
+            --title "v$V" --notes-file dist/release-notes.md
+          tag_sha=$(gh api "repos/$REPO/commits/v$V" --jq .sha)
+          [ "$tag_sha" = "$GITHUB_SHA" ] || { echo "::error::tag v$V points at '$tag_sha', expected $GITHUB_SHA"; exit 1; }
+          echo "released v$V at $GITHUB_SHA: $(cat dist/image-digest.txt)"

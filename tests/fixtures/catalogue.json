@@ -1,0 +1,15 @@
+{
+  "generated_at": "2026-01-01T00:00:00Z",
+  "gateway_host": "gateway.example.com",
+  "counts": {
+    "enumerated": 2,
+    "openrouter_catalogue": 2,
+    "declared_picker": 1
+  },
+  "enumerated": ["anthropic/claude-example", "openrouter/vendor/model-a"],
+  "declared_picker": ["openrouter/vendor/model-a"],
+  "openrouter": [
+    { "id": "vendor/model-a", "name": "Model A", "context_length": 128000 },
+    { "id": "vendor/model-b", "name": "Model B", "context_length": 32000 }
+  ]
+}
