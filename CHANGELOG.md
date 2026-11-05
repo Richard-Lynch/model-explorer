@@ -4,6 +4,23 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] — 2026-11-05
+
+### Security
+
+- zod 4.6.7 (from 4.6.5): GHSA-mrhx-c7xc-m3w5 (CVE-2023-54404). An array schema without a
+  length bound could be made to exhaust memory. The app parses the catalogue snapshot in the
+  browser, so an oversized snapshot could have hung the page. Fixed here.
+- vite 6.4.5 (from 5.4.21): GHSA-4w7w-66w2-5vf9 (CVE-2026-39365), a path traversal through the
+  dev server's `.map` handling. It applies only to a dev server exposed with `--host`; the
+  release image serves the built bundle and runs no dev server. Taken to stay on a supported
+  major.
+- vitest 4.1.12 (from 2.1.9): GHSA-5xrq-8626-4rwp (CVE-2026-47429), file read and execution
+  through an exposed Vitest UI or API server. Tests here run headless (`vitest run`) with no UI,
+  so it does not apply. Taken because vitest 4 is the release line that supports vite 6.
+- `npm audit` reports 0 vulnerabilities. The unit tests are unchanged and still fail when the
+  model-id refusal is removed.
+
 ## [1.0.0] — 2026-11-05
 
 ### Added
